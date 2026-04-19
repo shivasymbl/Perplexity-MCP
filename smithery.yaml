@@ -1,0 +1,17 @@
+runtime: "container"
+build:
+  dockerfile: "Dockerfile"
+  dockerBuildPath: "."
+startCommand:
+  type: "http"
+configSchema:
+  type: "object"
+  required:
+    - "PERPLEXITY_API_KEY"
+  properties:
+    PERPLEXITY_API_KEY:
+      type: "string"
+      description: "Your Perplexity API key from https://www.perplexity.ai/settings/api"
+    PERPLEXITY_TIMEOUT_MS:
+      type: "string"
+      description: "Request timeout in milliseconds (default: 300000)"

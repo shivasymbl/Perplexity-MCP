@@ -1,0 +1,71 @@
+{
+  "name": "@perplexity-ai/mcp-server",
+  "version": "0.9.0",
+  "mcpName": "ai.perplexity/mcp-server",
+  "description": "Real-time web search, reasoning, and research through Perplexity's API",
+  "keywords": [
+    "ai",
+    "perplexity",
+    "mcp",
+    "modelcontextprotocol"
+  ],
+  "homepage": "https://docs.perplexity.ai/guides/mcp-server",
+  "bugs": {
+    "url": "https://github.com/perplexityai/modelcontextprotocol/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/perplexityai/modelcontextprotocol.git"
+  },
+  "license": "MIT",
+  "author": "Perplexity <>",
+  "publishConfig": {
+    "access": "public"
+  },
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "perplexity-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist/*.js",
+    "!dist/*.test.js",
+    "!dist/vitest.config.js",
+    "README.md",
+    ".claude-plugin"
+  ],
+  "scripts": {
+    "build": "tsc && shx chmod +x dist/*.js",
+    "prepare": "npm run build",
+    "watch": "tsc --watch",
+    "start": "node dist/index.js",
+    "start:http": "node dist/http.js",
+    "start:http:public": "BIND_ADDRESS=0.0.0.0 ALLOWED_ORIGINS=* node dist/http.js",
+    "dev": "tsx src/index.ts",
+    "dev:http": "tsx src/http.ts",
+    "dev:http:public": "BIND_ADDRESS=0.0.0.0 ALLOWED_ORIGINS=* tsx src/http.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.21.1",
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "undici": "^6.20.0",
+    "zod": "^3.25.46"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.17",
+    "@types/express": "^5.0.0",
+    "@types/node": "^20",
+    "@vitest/coverage-v8": "^4.0.5",
+    "shx": "^0.4.0",
+    "tsx": "^4.19.4",
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.5"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

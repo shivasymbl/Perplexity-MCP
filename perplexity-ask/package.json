@@ -1,0 +1,51 @@
+{
+  "name": "@perplexity-ai/mcp-server",
+  "version": "0.2.0",
+  "description": "Official MCP server for Perplexity API Platform",
+  "keywords": [
+    "ai",
+    "perplexity",
+    "mcp",
+    "modelcontextprotocol"
+  ],
+  "homepage": "https://docs.perplexity.ai/guides/mcp-server",
+  "bugs": {
+    "url": "https://github.com/perplexityai/modelcontextprotocol/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/perplexityai/modelcontextprotocol.git"
+  },
+  "license": "MIT",
+  "author": "Perplexity <>",
+  "publishConfig": {
+    "access": "public"
+  },
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "perplexity-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc && shx chmod +x dist/*.js",
+    "prepare": "npm run build",
+    "watch": "tsc --watch"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.1",
+    "axios": "^1.6.2",
+    "dotenv": "^16.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "shx": "^0.3.4",
+    "typescript": "^5.6.2"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
