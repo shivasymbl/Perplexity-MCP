@@ -1,5 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
+import { randomUUID } from "node:crypto";
 import { fetch as undiciFetch, ProxyAgent } from "undici";
 import type {
   Message,
@@ -10,6 +11,54 @@ import type {
   UndiciRequestOptions
 } from "./types.js";
 import { ChatCompletionResponseSchema, SearchResponseSchema } from "./validation.js";
+
+// =====================================================================
+// FORK ADDITION: in-memory async job store for start_research/check_research
+// pattern (Patch E). Lets clients with short tool-call timeouts (Claude.ai
+// web's 60s cap) run sonar-deep-research without timing out.
+//
+// Trade-offs:
+// - State is in-memory only. Container restart → all in-flight jobs lost.
+//   Acceptable for our single-instance Railway deployment with infrequent
+//   restarts; clients can detect via `status: not_found` and retry.
+// - 30-minute retention ceiling for completed jobs. 5-minute hard timeout
+//   for stuck jobs. Periodic GC every 60s.
+// - Each job ~5-50KB. Memory bound is generous (~5MB at 100 concurrent).
+// =====================================================================
+
+type JobStatus = "pending" | "running" | "done" | "error";
+
+interface ResearchJob {
+  id: string;
+  status: JobStatus;
+  query_preview: string; // first 200 chars of the user message — for diagnostics
+  startedAt: number;     // epoch ms
+  finishedAt?: number;
+  result?: string;
+  error?: string;
+}
+
+const RESEARCH_JOBS = new Map<string, ResearchJob>();
+
+const JOB_RETENTION_MS = 30 * 60_000; // 30 min for completed jobs
+const JOB_HARD_TIMEOUT_MS = 5 * 60_000; // 5 min for stuck pending/running jobs
+
+function gcResearchJobs(): void {
+  const now = Date.now();
+  for (const [id, job] of RESEARCH_JOBS) {
+    const age = now - job.startedAt;
+    if (job.status === "done" || job.status === "error") {
+      if (age > JOB_RETENTION_MS) RESEARCH_JOBS.delete(id);
+    } else if (age > JOB_HARD_TIMEOUT_MS) {
+      job.status = "error";
+      job.error = `Job exceeded ${JOB_HARD_TIMEOUT_MS / 1000}s hard timeout`;
+      job.finishedAt = now;
+    }
+  }
+}
+
+// One global GC interval. Keeps the process alive in dev, harmless in prod.
+setInterval(gcResearchJobs, 60_000).unref();
 
 const PERPLEXITY_API_KEY = process.env.PERPLEXITY_API_KEY;
 const PERPLEXITY_BASE_URL = process.env.PERPLEXITY_BASE_URL || "https://api.perplexity.ai";
@@ -307,10 +356,16 @@ export function createPerplexityServer(serviceOrigin?: string) {
     {
       instructions:
         "Perplexity AI server for web-grounded search, research, and reasoning. " +
-        "Use perplexity_search for finding URLs, facts, and recent news. " +
-        "Use perplexity_ask for quick AI-answered questions with citations. Supports recency filters, domain restrictions, and search context size control. " +
-        "Use perplexity_research for in-depth multi-source investigation (slow, 30s+). Supports reasoning_effort parameter to control depth. " +
-        "Use perplexity_reason for complex analysis requiring step-by-step logic. Supports recency filters, domain restrictions, and search context size control. " +
+        "\n\nTOOL TIMING (critical for Claude.ai web — has a hard 60s tool-call timeout):\n" +
+        "- perplexity_search: 1-3s. Quick web search returning ranked results (title/URL/snippet/date). No AI synthesis.\n" +
+        "- perplexity_ask: 5-15s. Sonar Pro conversational answer with citations. PREFERRED for time-sensitive queries.\n" +
+        "- perplexity_reason: 10-30s. Sonar Reasoning Pro with chain-of-thought. May approach 60s on complex prompts.\n" +
+        "- perplexity_research (sync): 30-180s. Sonar Deep Research. WILL TIME OUT in Claude.ai web — use ONLY in Claude Desktop / Claude Code / terminal MCP clients.\n" +
+        "- start_research + check_research (async): the timeout-safe alternative for deep research from any client. " +
+        "Call start_research → returns job_id immediately → poll check_research every 30s until status='done'. Bypasses the 60s client cap.\n" +
+        "\nSelection rule: for multi-topic 'give me a summary of X, Y, Z' queries from Claude.ai web, prefer perplexity_ask. " +
+        "Reach for sync perplexity_research only when you know your client tolerates >60s. " +
+        "Use start_research when you need deep research AND the client has a short timeout. " +
         "All tools are read-only and access live web data.",
     }
   );
@@ -366,11 +421,14 @@ export function createPerplexityServer(serviceOrigin?: string) {
     {
       title: "Ask Perplexity",
       description: "Answer a question using web-grounded AI (Sonar Pro model). " +
-        "Best for: quick factual questions, summaries, explanations, and general Q&A. " +
-        "Returns a text response with numbered citations. Fastest and cheapest option. " +
+        "Latency: 5-15s typical. SAFE for Claude.ai web (60s client cap). " +
+        "Best for: quick factual questions, summaries, explanations, general Q&A, and " +
+        "MULTI-TOPIC SUMMARIES that would otherwise need slow research. " +
+        "Returns a text response with numbered citations. Fast and cheap. " +
         "Supports filtering by recency (hour/day/week/month/year), domain restrictions, and search context size. " +
-        "For in-depth multi-source research, use perplexity_research instead. " +
-        "For step-by-step reasoning and analysis, use perplexity_reason instead.",
+        "For deep multi-source research from a timeout-tolerant client, use perplexity_research. " +
+        "For deep research from Claude.ai web (60s cap), use start_research + check_research instead. " +
+        "For step-by-step reasoning, use perplexity_reason.",
       inputSchema: messagesOnlyInputSchema as any,
       outputSchema: responseOutputSchema as any,
       annotations: {
@@ -404,13 +462,16 @@ export function createPerplexityServer(serviceOrigin?: string) {
   server.registerTool(
     "perplexity_research",
     {
-      title: "Deep Research",
+      title: "Deep Research (sync — may time out)",
       description: "Conduct deep, multi-source research on a topic (Sonar Deep Research model). " +
+        "Latency: 30-180+ seconds. ⚠️ WILL TIME OUT in Claude.ai web (60s hard client cap). " +
+        "Use ONLY in Claude Desktop, Claude Code, terminal MCP clients, or other " +
+        "clients with >180s tool-call tolerance. " +
+        "From Claude.ai web: use start_research + check_research instead (async pattern, no cap). " +
         "Best for: literature reviews, comprehensive overviews, investigative queries needing " +
         "many sources. Returns a detailed response with numbered citations. " +
-        "Significantly slower than other tools (30+ seconds). " +
-        "For quick factual questions, use perplexity_ask instead. " +
-        "For logical analysis and reasoning, use perplexity_reason instead.",
+        "For quick factual questions, use perplexity_ask. " +
+        "For logical analysis and reasoning, use perplexity_reason.",
       inputSchema: researchInputSchema as any,
       outputSchema: responseOutputSchema as any,
       annotations: {
@@ -444,11 +505,12 @@ export function createPerplexityServer(serviceOrigin?: string) {
     {
       title: "Advanced Reasoning",
       description: "Analyze a question using step-by-step reasoning with web grounding (Sonar Reasoning Pro model). " +
+        "Latency: 10-30s typical, can approach 60s on complex prompts (risk of Claude.ai web timeout). " +
         "Best for: math, logic, comparisons, complex arguments, and tasks requiring chain-of-thought. " +
         "Returns a reasoned response with numbered citations. " +
         "Supports filtering by recency (hour/day/week/month/year), domain restrictions, and search context size. " +
-        "For quick factual questions, use perplexity_ask instead. " +
-        "For comprehensive multi-source research, use perplexity_research instead.",
+        "For quick factual questions, use perplexity_ask. " +
+        "For comprehensive multi-source research, use perplexity_research (sync) or start_research (async).",
       inputSchema: messagesWithStripThinkingInputSchema as any,
       outputSchema: responseOutputSchema as any,
       annotations: {
@@ -500,6 +562,7 @@ export function createPerplexityServer(serviceOrigin?: string) {
     {
       title: "Search the Web",
       description: "Search the web and return a ranked list of results with titles, URLs, snippets, and dates. " +
+        "Latency: 1-3s. FASTEST tool — always safe within Claude.ai web 60s cap. " +
         "Best for: finding specific URLs, checking recent news, verifying facts, discovering sources. " +
         "Returns formatted results (title, URL, snippet, date) — no AI synthesis. " +
         "For AI-generated answers with citations, use perplexity_ask instead.",
@@ -529,6 +592,187 @@ export function createPerplexityServer(serviceOrigin?: string) {
         structuredContent: { results: result },
       };
     }
+  );
+
+  // =====================================================================
+  // FORK ADDITION: async polling pattern for sonar-deep-research.
+  // Bypasses Claude.ai web's 60s hard tool-call timeout.
+  // =====================================================================
+
+  const startResearchInputSchema = {
+    messages: messagesField,
+    strip_thinking: stripThinkingField,
+    reasoning_effort: reasoningEffortField,
+  };
+  const startResearchOutputSchema = {
+    job_id: z.string().describe("Opaque job identifier — pass to check_research to poll status"),
+    status: z.string().describe("Initial status (always 'pending' on success)"),
+    poll_after_seconds: z.number().describe("Recommended seconds to wait before first check_research call"),
+  };
+
+  server.registerTool(
+    "start_research",
+    {
+      title: "Start Deep Research (async)",
+      description: "Kick off a sonar-deep-research job and return immediately with a job_id (~1s). " +
+        "Use this from Claude.ai web (or any client with <60s tool-call timeout) to do deep " +
+        "research without hitting the cap. After calling: poll check_research every 30s with " +
+        "the returned job_id until status='done'. Typical completion: 30-180s. " +
+        "For sync deep research (when client tolerates >180s), use perplexity_research instead.",
+      inputSchema: startResearchInputSchema as any,
+      outputSchema: startResearchOutputSchema as any,
+      annotations: {
+        readOnlyHint: false, // creates server-side state (the job)
+        openWorldHint: true,
+        idempotentHint: false,
+        destructiveHint: false,
+      },
+    },
+    async (args: any) => {
+      const { messages, strip_thinking, reasoning_effort } = args as {
+        messages: Message[];
+        strip_thinking?: boolean;
+        reasoning_effort?: "minimal" | "low" | "medium" | "high";
+      };
+      validateMessages(messages, "start_research");
+
+      const id = randomUUID();
+      const lastUserMsg = [...messages].reverse().find((m) => m.role === "user");
+      const job: ResearchJob = {
+        id,
+        status: "pending",
+        query_preview: (lastUserMsg?.content ?? "").slice(0, 200),
+        startedAt: Date.now(),
+      };
+      RESEARCH_JOBS.set(id, job);
+
+      // Fire-and-forget background work. Errors handled inside the closure;
+      // never escape to the start_research caller.
+      (async () => {
+        job.status = "running";
+        try {
+          const stripThinking = typeof strip_thinking === "boolean" ? strip_thinking : false;
+          const options = reasoning_effort ? { reasoning_effort } : undefined;
+          const result = await performChatCompletion(
+            messages,
+            "sonar-deep-research",
+            stripThinking,
+            serviceOrigin,
+            options as ChatCompletionOptions | undefined,
+          );
+          job.status = "done";
+          job.result = result;
+          job.finishedAt = Date.now();
+        } catch (e) {
+          job.status = "error";
+          job.error = e instanceof Error ? e.message : String(e);
+          job.finishedAt = Date.now();
+        }
+      })();
+
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text:
+              `Research job started.\n` +
+              `job_id: ${id}\n` +
+              `status: pending\n` +
+              `Recommended next step: call check_research with this job_id after 30s.`,
+          },
+        ],
+        structuredContent: { job_id: id, status: "pending", poll_after_seconds: 30 },
+      };
+    },
+  );
+
+  const checkResearchInputSchema = {
+    job_id: z.string().describe("Job ID returned by start_research"),
+  };
+  const checkResearchOutputSchema = {
+    status: z.string().describe("One of: pending, running, done, error, not_found"),
+    elapsed_seconds: z.number().describe("How long the job has been running (or took, if finished)"),
+    response: z.string().optional().describe("Final research response — only present when status='done'"),
+    error: z.string().optional().describe("Error message — only present when status='error'"),
+  };
+
+  server.registerTool(
+    "check_research",
+    {
+      title: "Check Research Status (async)",
+      description: "Poll the status of a research job started by start_research. " +
+        "Returns within ~1s — safe within any client's tool-call timeout. " +
+        "Returns status='pending'/'running' (keep polling), 'done' (response field has the result), " +
+        "'error' (error field has the failure reason), or 'not_found' (job ID expired or never existed). " +
+        "Recommended poll interval: 30s. Job retention: 30 minutes after completion.",
+      inputSchema: checkResearchInputSchema as any,
+      outputSchema: checkResearchOutputSchema as any,
+      annotations: {
+        readOnlyHint: true,
+        openWorldHint: false,
+        idempotentHint: true,
+        destructiveHint: false,
+      },
+    },
+    async (args: any) => {
+      const { job_id } = args as { job_id: string };
+      const job = RESEARCH_JOBS.get(job_id);
+      if (!job) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text:
+                `Job ${job_id} not found. Possible reasons:\n` +
+                `- Never existed (typo in job_id)\n` +
+                `- Expired (jobs are kept for 30 minutes after completion)\n` +
+                `- Server restarted (in-memory state was lost — start a new job)`,
+            },
+          ],
+          structuredContent: { status: "not_found", elapsed_seconds: 0 },
+        };
+      }
+      const elapsed = Math.round(((job.finishedAt ?? Date.now()) - job.startedAt) / 1000);
+
+      if (job.status === "done") {
+        return {
+          content: [{ type: "text" as const, text: job.result ?? "" }],
+          structuredContent: {
+            status: "done",
+            elapsed_seconds: elapsed,
+            response: job.result,
+          },
+        };
+      }
+      if (job.status === "error") {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Research job ${job_id} failed after ${elapsed}s.\nError: ${job.error}`,
+            },
+          ],
+          structuredContent: {
+            status: "error",
+            elapsed_seconds: elapsed,
+            error: job.error,
+          },
+          isError: true,
+        };
+      }
+      // pending or running
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text:
+              `Research job ${job_id} is still ${job.status} (elapsed ${elapsed}s). ` +
+              `Poll again in 30s. Typical completion: 30-180s.`,
+          },
+        ],
+        structuredContent: { status: job.status, elapsed_seconds: elapsed },
+      };
+    },
   );
 
   return server.server;
