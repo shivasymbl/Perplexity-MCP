@@ -38,8 +38,6 @@ app.use(cors({
 
 app.use(express.json());
 
-const mcpServer = createPerplexityServer();
-
 app.all("/mcp", async (req, res) => {
   try {
     const transport = new StreamableHTTPServerTransport({
@@ -51,6 +49,7 @@ app.all("/mcp", async (req, res) => {
       transport.close();
     });
 
+    const mcpServer = createPerplexityServer();
     await mcpServer.connect(transport);
     
     await transport.handleRequest(req, res, req.body);
