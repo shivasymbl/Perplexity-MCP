@@ -5,37 +5,68 @@ export interface Message {
   content: string;
 }
 
-export interface ChatMessage {
+export interface AgentInputMessage {
+  type: "message";
+  role: string;
   content: string;
-  role?: string;
 }
 
-export interface ChatChoice {
-  message: ChatMessage;
-  finish_reason?: string;
-  index?: number;
+export interface AgentAnnotation {
+  type?: string | null;
+  url?: string | null;
+  title?: string | null;
 }
 
-export interface TokenUsage {
-  prompt_tokens?: number;
-  completion_tokens?: number;
+export interface AgentContentPart {
+  type: string;
+  text?: string | null;
+  annotations?: AgentAnnotation[] | null;
+}
+
+export interface AgentSearchResult {
+  id?: number | null;
+  url?: string | null;
+  title?: string | null;
+  snippet?: string | null;
+  date?: string | null;
+}
+
+export interface AgentOutputItem {
+  type: string;
+  // "message" items
+  role?: string | null;
+  content?: AgentContentPart[] | null;
+  // "search_results" items
+  results?: AgentSearchResult[] | null;
+}
+
+export interface AgentCost {
+  total_cost?: number;
+  currency?: string;
+}
+
+export interface AgentUsage {
+  input_tokens?: number;
+  output_tokens?: number;
   total_tokens?: number;
+  cost?: AgentCost;
 }
 
-export interface ChatCompletionResponse {
-  choices: ChatChoice[];
-  citations?: string[];
-  usage?: TokenUsage;
-  id?: string;
-  model?: string;
-  created?: number;
+export interface AgentResponse {
+  id?: string | null;
+  status?: string | null;
+  model?: string | null;
+  output: AgentOutputItem[];
+  usage?: AgentUsage;
+  error?: { message?: string | null; type?: string | null } | null;
 }
 
 export interface SearchResult {
   title: string;
   url: string;
   snippet?: string;
-  date?: string;
+  date?: string | null;
+  last_updated?: string | null;
   score?: number;
 }
 
@@ -56,11 +87,46 @@ export interface SearchRequestBody {
   country?: string;
 }
 
-export interface ChatCompletionOptions {
+export type SearchType = "web" | "fast";
+
+export interface SearchOptions extends Pick<AgentToolOptions, "search_recency_filter" | "search_domain_filter"> {
+  search_type?: SearchType;
+}
+
+export interface AgentToolOptions {
   search_recency_filter?: "hour" | "day" | "week" | "month" | "year";
   search_domain_filter?: string[];
   search_context_size?: "low" | "medium" | "high";
-  reasoning_effort?: "minimal" | "low" | "medium" | "high";
+  max_tokens?: number;
+  max_tokens_per_page?: number;
+}
+
+export interface AgentProgressUpdate {
+  message: string;
+}
+
+/**
+ * Resolves the API key for an upstream Perplexity API call. Invoked once per
+ * request, so a closure over per-request state (e.g. an inbound Authorization
+ * header) gives each embedded server instance its own key.
+ */
+export type ApiKeyProvider = () => string | undefined;
+
+export interface PerplexityServerOptions {
+  /**
+   * Per-call API key resolution for embedders hosting the server for more
+   * than one key (multi-tenant). When set, the PERPLEXITY_API_KEY environment
+   * variable is never consulted: a provider that returns no key fails the
+   * call rather than silently falling back to the process-wide key.
+   */
+  apiKey?: ApiKeyProvider;
+}
+
+export interface AgentCallHooks {
+  /** Abort signal from the MCP request; triggers server-side cancellation. */
+  signal?: AbortSignal;
+  /** Called with human-readable progress while the agent run is in flight. */
+  onProgress?: (update: AgentProgressUpdate) => void;
 }
 
 export interface UndiciRequestOptions {

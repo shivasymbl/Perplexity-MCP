@@ -1,6 +1,6 @@
 {
   "name": "@perplexity-ai/mcp-server",
-  "version": "0.9.0",
+  "version": "1.4.0",
   "mcpName": "ai.perplexity/mcp-server",
   "description": "Real-time web search, reasoning, and research through Perplexity's API",
   "keywords": [
@@ -23,14 +23,25 @@
     "access": "public"
   },
   "type": "module",
-  "main": "dist/index.js",
+  "main": "dist/server.js",
+  "types": "dist/server.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/server.d.ts",
+      "default": "./dist/server.js"
+    },
+    "./package.json": "./package.json"
+  },
   "bin": {
     "perplexity-mcp": "dist/index.js"
   },
   "files": [
     "dist/*.js",
+    "dist/*.d.ts",
     "!dist/*.test.js",
+    "!dist/*.test.d.ts",
     "!dist/vitest.config.js",
+    "!dist/vitest.config.d.ts",
     "README.md",
     ".claude-plugin"
   ],
@@ -40,20 +51,20 @@
     "watch": "tsc --watch",
     "start": "node dist/index.js",
     "start:http": "node dist/http.js",
-    "start:http:public": "BIND_ADDRESS=0.0.0.0 ALLOWED_ORIGINS=* node dist/http.js",
+    "start:http:UNSAFE-public": "BIND_ADDRESS=0.0.0.0 ALLOWED_ORIGINS=* node dist/http.js",
     "dev": "tsx src/index.ts",
     "dev:http": "tsx src/http.ts",
-    "dev:http:public": "BIND_ADDRESS=0.0.0.0 ALLOWED_ORIGINS=* tsx src/http.ts",
+    "dev:http:UNSAFE-public": "BIND_ADDRESS=0.0.0.0 ALLOWED_ORIGINS=* tsx src/http.ts",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.21.1",
-    "cors": "^2.8.5",
-    "express": "^4.21.2",
-    "undici": "^6.20.0",
-    "zod": "^3.25.46"
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "cors": "^2.8.6",
+    "express": "^5.2.1",
+    "undici": "^8.11.2",
+    "zod": "^4.6.5"
   },
   "devDependencies": {
     "@types/cors": "^2.8.17",
@@ -66,6 +77,6 @@
     "vitest": "^4.0.5"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=22.19.0"
   }
 }

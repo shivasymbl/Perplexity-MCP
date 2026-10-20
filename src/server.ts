@@ -4,18 +4,25 @@ import { randomUUID } from "node:crypto";
 import { fetch as undiciFetch, ProxyAgent } from "undici";
 import type {
   Message,
-  ChatCompletionResponse,
-  ChatCompletionOptions,
+  AgentResponse,
+  AgentSearchResult,
+  AgentToolOptions,
+  AgentCallHooks,
+  ApiKeyProvider,
+  PerplexityServerOptions,
+  SearchOptions,
   SearchResponse,
-  SearchRequestBody,
+  SearchType,
   UndiciRequestOptions
 } from "./types.js";
-import { ChatCompletionResponseSchema, SearchResponseSchema } from "./validation.js";
+import { AgentResponseSchema, SearchResponseSchema } from "./validation.js";
+
+export type { ApiKeyProvider, PerplexityServerOptions } from "./types.js";
 
 // =====================================================================
 // FORK ADDITION: in-memory async job store for start_research/check_research
 // pattern (Patch E). Lets clients with short tool-call timeouts (Claude.ai
-// web's 60s cap) run sonar-deep-research without timing out.
+// web's 60s cap) run deep research without timing out.
 //
 // Trade-offs:
 // - State is in-memory only. Container restart → all in-flight jobs lost.
@@ -64,12 +71,17 @@ setInterval(gcResearchJobs, 60_000).unref();
 
 const PERPLEXITY_API_KEY = process.env.PERPLEXITY_API_KEY;
 const PERPLEXITY_BASE_URL = process.env.PERPLEXITY_BASE_URL || "https://api.perplexity.ai";
-const VERSION = "0.9.0";
+const VERSION = "1.4.0";
+
+// Agent API presets backing each tool: https://docs.perplexity.ai/docs/agent-api/presets
+export const ASK_PRESET = "fast";
+export const REASON_PRESET = "medium";
+export const RESEARCH_PRESET = "high";
 
 export function getProxyUrl(): string | undefined {
-  return process.env.PERPLEXITY_PROXY || 
-         process.env.HTTPS_PROXY || 
-         process.env.HTTP_PROXY || 
+  return process.env.PERPLEXITY_PROXY ||
+         process.env.HTTPS_PROXY ||
+         process.env.HTTP_PROXY ||
          undefined;
 }
 
@@ -108,17 +120,26 @@ export function validateMessages(messages: unknown, toolName: string): asserts m
   }
 }
 
-export function stripThinkingTokens(content: string): string {
-  return content.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
-}
-
 async function makeApiRequest(
   endpoint: string,
   body: Record<string, unknown>,
   serviceOrigin: string | undefined,
+  signal?: AbortSignal,
+  apiKey?: ApiKeyProvider,
 ): Promise<Response> {
-  if (!PERPLEXITY_API_KEY) {
-    throw new Error("PERPLEXITY_API_KEY environment variable is required");
+  // A configured provider fully replaces the env var: falling back would let
+  // a multi-tenant misconfiguration silently bill the process-wide key.
+  let resolvedApiKey: string | undefined;
+  if (apiKey) {
+    resolvedApiKey = apiKey();
+    if (!resolvedApiKey) {
+      throw new Error("API key provider returned no key");
+    }
+  } else {
+    resolvedApiKey = PERPLEXITY_API_KEY;
+    if (!resolvedApiKey) {
+      throw new Error("PERPLEXITY_API_KEY environment variable is required");
+    }
   }
 
   // Read timeout fresh each time to respect env var changes
@@ -127,14 +148,23 @@ async function makeApiRequest(
   const url = new URL(`${PERPLEXITY_BASE_URL}/${endpoint}`);
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  // An abort from the caller's signal also tears down an in-flight body stream.
+  if (signal) {
+    if (signal.aborted) {
+      controller.abort();
+    } else {
+      signal.addEventListener("abort", () => controller.abort(), { once: true });
+    }
+  }
 
   let response;
   try {
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
-      "Authorization": `Bearer ${PERPLEXITY_API_KEY}`,
+      "Authorization": `Bearer ${resolvedApiKey}`,
       "User-Agent": `perplexity-mcp/${VERSION}`,
       "X-Source": "pplx-mcp-server",
+      "X-Pplx-Integration": `perplexity-mcp/${VERSION}`,
     };
     if (serviceOrigin) {
       headers["X-Service"] = serviceOrigin;
@@ -148,6 +178,10 @@ async function makeApiRequest(
   } catch (error) {
     clearTimeout(timeoutId);
     if (error instanceof Error && error.name === "AbortError") {
+      if (signal?.aborted) {
+        // The caller knows whether its signal meant cancellation or deadline.
+        throw error;
+      }
       throw new Error(`Request timeout: Perplexity API did not respond within ${TIMEOUT_MS}ms. Consider increasing PERPLEXITY_TIMEOUT_MS.`);
     }
     throw new Error(`Network error while calling Perplexity API: ${error}`);
@@ -169,7 +203,26 @@ async function makeApiRequest(
   return response;
 }
 
-export async function consumeSSEStream(response: Response): Promise<ChatCompletionResponse> {
+/** Best-effort cancellation of an agent run so an abandoned request stops billing. */
+export async function cancelAgentResponse(responseId: string, serviceOrigin?: string, apiKey?: ApiKeyProvider): Promise<void> {
+  try {
+    await makeApiRequest(`v1/agent/${encodeURIComponent(responseId)}/cancel`, {}, serviceOrigin, undefined, apiKey);
+  } catch {
+    // The run may already be terminal; nothing actionable either way.
+  }
+}
+
+/**
+ * Consume an Agent API SSE stream and return the final response object.
+ * Emits progress via hooks.onProgress as reasoning events arrive.
+ */
+export async function consumeAgentStream(
+  response: Response,
+  hooks?: AgentCallHooks,
+  serviceOrigin?: string,
+  deadlineSignal?: AbortSignal,
+  apiKey?: ApiKeyProvider,
+): Promise<AgentResponse> {
   const body = response.body;
   if (!body) {
     throw new Error("Response body is null");
@@ -178,126 +231,290 @@ export async function consumeSSEStream(response: Response): Promise<ChatCompleti
   const reader = (body as ReadableStream<Uint8Array>).getReader();
   const decoder = new TextDecoder();
 
-  let contentParts: string[] = [];
-  let citations: string[] | undefined;
-  let usage: ChatCompletionResponse["usage"] | undefined;
-  let id: string | undefined;
-  let model: string | undefined;
-  let created: number | undefined;
   let buffer = "";
+  let eventName: string | undefined;
+  let responseId: string | undefined;
+  let finalResponse: unknown;
+  let streamError: string | undefined;
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-
-    buffer += decoder.decode(value, { stream: true });
-
-    const lines = buffer.split("\n");
-    // Keep the last potentially incomplete line in the buffer
-    buffer = lines.pop() || "";
-
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed || !trimmed.startsWith("data:")) continue;
-
-      const data = trimmed.slice("data:".length).trim();
-      if (data === "[DONE]") continue;
-
-      try {
-        const parsed = JSON.parse(data);
-
-        if (parsed.id) id = parsed.id;
-        if (parsed.model) model = parsed.model;
-        if (parsed.created) created = parsed.created;
-        if (parsed.citations) citations = parsed.citations;
-        if (parsed.usage) usage = parsed.usage;
-
-        const delta = parsed.choices?.[0]?.delta;
-        if (delta?.content) {
-          contentParts.push(delta.content);
+  const handleEvent = (type: string, parsed: Record<string, unknown>) => {
+    const eventResponse = parsed.response as { id?: string } | undefined;
+    if (eventResponse?.id) {
+      responseId = eventResponse.id;
+    }
+    switch (type) {
+      case "response.completed":
+        finalResponse = parsed.response;
+        break;
+      case "response.failed": {
+        const error = parsed.error as { message?: string } | undefined;
+        streamError = error?.message || "Agent request failed";
+        break;
+      }
+      case "response.cancelled":
+        streamError = "Agent request was cancelled";
+        break;
+      case "error": {
+        const error = parsed.error as { message?: string } | undefined;
+        streamError = error?.message || (typeof parsed.message === "string" ? parsed.message : "Agent request failed");
+        break;
+      }
+      case "response.reasoning.search_queries": {
+        const queries = Array.isArray(parsed.queries) ? parsed.queries.filter((q) => typeof q === "string") : [];
+        if (queries.length > 0) {
+          hooks?.onProgress?.({ message: `Searching: ${queries.join(" | ")}` });
         }
-      } catch {
-        // Skip malformed JSON chunks (e.g. keep-alive pings)
+        break;
+      }
+      case "response.reasoning.search_results": {
+        const results = Array.isArray(parsed.results) ? parsed.results : [];
+        if (results.length > 0) {
+          hooks?.onProgress?.({ message: `Reading ${results.length} search results` });
+        }
+        break;
+      }
+      case "response.reasoning.fetch_url_queries":
+        hooks?.onProgress?.({ message: "Fetching page content" });
+        break;
+      case "response.output_item.added": {
+        const item = parsed.item as { type?: string } | undefined;
+        if (item?.type === "message") {
+          hooks?.onProgress?.({ message: "Writing answer" });
+        }
+        break;
       }
     }
-  }
-
-  const assembled: ChatCompletionResponse = {
-    choices: [
-      {
-        message: { content: contentParts.join("") },
-        finish_reason: "stop",
-        index: 0,
-      },
-    ],
-    ...(citations && { citations }),
-    ...(usage && { usage }),
-    ...(id && { id }),
-    ...(model && { model }),
-    ...(created && { created }),
   };
 
-  return ChatCompletionResponseSchema.parse(assembled);
-}
+  // Stop reading as soon as a terminal event is in hand: waiting for the
+  // server to close the socket would let a deadline abort in the tail window
+  // discard an already-received (and billed) answer.
+  const isTerminal = () => finalResponse !== undefined || streamError !== undefined;
 
-export async function performChatCompletion(
-  messages: Message[],
-  model: string = "sonar-pro",
-  stripThinking: boolean = false,
-  serviceOrigin?: string,
-  options?: ChatCompletionOptions
-): Promise<string> {
-  const useStreaming = model === "sonar-deep-research";
-
-  const body: Record<string, unknown> = {
-    model: model,
-    messages: messages,
-    ...(useStreaming && { stream: true }),
-    ...(options?.search_recency_filter && { search_recency_filter: options.search_recency_filter }),
-    ...(options?.search_domain_filter && { search_domain_filter: options.search_domain_filter }),
-    ...(options?.search_context_size && { web_search_options: { search_context_size: options.search_context_size } }),
-    ...(options?.reasoning_effort && { reasoning_effort: options.reasoning_effort }),
-  };
-
-  const response = await makeApiRequest("chat/completions", body, serviceOrigin);
-
-  let data: ChatCompletionResponse;
   try {
-    if (useStreaming) {
-      data = await consumeSSEStream(response);
-    } else {
-      const json = await response.json();
-      data = ChatCompletionResponseSchema.parse(json);
+    while (!isTerminal()) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+
+      const lines = buffer.split("\n");
+      // Keep the last potentially incomplete line in the buffer
+      buffer = lines.pop() || "";
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) {
+          eventName = undefined;
+          continue;
+        }
+        if (trimmed.startsWith("event:")) {
+          eventName = trimmed.slice("event:".length).trim();
+          continue;
+        }
+        if (!trimmed.startsWith("data:")) continue;
+
+        const data = trimmed.slice("data:".length).trim();
+        if (data === "[DONE]") continue;
+
+        try {
+          const parsed = JSON.parse(data) as Record<string, unknown>;
+          const type = typeof parsed.type === "string" ? parsed.type : eventName;
+          if (type) {
+            handleEvent(type, parsed);
+          }
+        } catch {
+          // Skip malformed JSON chunks (e.g. keep-alive pings)
+        }
+        if (isTerminal()) break;
+      }
+    }
+    if (isTerminal()) {
+      void reader.cancel().catch(() => {});
     }
   } catch (error) {
-    if (error instanceof z.ZodError) {
-      const issues = error.issues;
-      if (issues.some(i => i.path.includes('message') || i.path.includes('content'))) {
-        throw new Error("Invalid API response: missing message content");
+    if (hooks?.signal?.aborted || deadlineSignal?.aborted) {
+      if (responseId) {
+        // Stop the server-side run so an abandoned request stops billing.
+        void cancelAgentResponse(responseId, serviceOrigin, apiKey);
       }
-      if (issues.some(i => i.path.includes('choices'))) {
-        throw new Error("Invalid API response: missing or empty choices array");
+      if (hooks?.signal?.aborted) {
+        throw new Error("Request cancelled");
+      }
+      throw error;
+    }
+    throw new Error(`Network error while streaming from Perplexity API: ${error}`);
+  }
+
+  if (hooks?.signal?.aborted) {
+    if (responseId) {
+      void cancelAgentResponse(responseId, serviceOrigin, apiKey);
+    }
+    throw new Error("Request cancelled");
+  }
+
+  if (streamError) {
+    throw new Error(`Perplexity API error: ${streamError}`);
+  }
+
+  if (!finalResponse) {
+    throw new Error("Agent stream ended without a completed response");
+  }
+
+  try {
+    return AgentResponseSchema.parse(finalResponse) as AgentResponse;
+  } catch (error) {
+    throw new Error(`Invalid response from Perplexity Agent API: ${error}`);
+  }
+}
+
+export function extractAgentText(response: AgentResponse): string {
+  return response.output
+    .filter((item) => item.type === "message")
+    .flatMap((item) => item.content ?? [])
+    .filter((part) => part.type === "output_text" && typeof part.text === "string")
+    .map((part) => part.text as string)
+    .join("");
+}
+
+/**
+ * Append the "Citations:" block ("[n] url" lines) to the answer text, keyed
+ * by the numeric search-result ids that inline references point at. The
+ * answer body is never modified: bracketed tokens also appear in code, LaTeX,
+ * and slice syntax, so any rewrite risks corrupting the answer. If ids are
+ * missing or ambiguous, all unique source URLs are appended with positional
+ * numbering instead.
+ */
+export function formatAgentResponseText(response: AgentResponse): string {
+  const text = extractAgentText(response);
+
+  const entries: Array<{ id?: number | null; url: string }> = [];
+  const urlById = new Map<number, string>();
+  let idsUsable = true;
+  for (const item of response.output) {
+    if (item.type !== "search_results" || !Array.isArray(item.results)) continue;
+    for (const result of item.results as AgentSearchResult[]) {
+      if (!result.url) continue;
+      entries.push({ id: result.id, url: result.url });
+      if (typeof result.id !== "number") {
+        idsUsable = false;
+        continue;
+      }
+      const existing = urlById.get(result.id);
+      if (existing === undefined) {
+        urlById.set(result.id, result.url);
+      } else if (existing !== result.url) {
+        idsUsable = false;
       }
     }
-    throw new Error(`Failed to parse JSON response from Perplexity API: ${error}`);
   }
 
-  const firstChoice = data.choices[0];
-
-  let messageContent = firstChoice.message.content;
-
-  if (stripThinking) {
-    messageContent = stripThinkingTokens(messageContent);
+  if (entries.length === 0) {
+    return text;
   }
 
-  if (data.citations && Array.isArray(data.citations) && data.citations.length > 0) {
-    messageContent += "\n\nCitations:\n";
-    data.citations.forEach((citation, index) => {
-      messageContent += `[${index + 1}] ${citation}\n`;
-    });
+  let output = text + "\n\nCitations:\n";
+  if (idsUsable) {
+    const emitted = new Set<number>();
+    for (const entry of entries) {
+      const id = entry.id as number;
+      if (emitted.has(id)) continue;
+      emitted.add(id);
+      output += `[${id}] ${entry.url}\n`;
+    }
+    return output;
   }
 
-  return messageContent;
+  const seen = new Set<string>();
+  let position = 0;
+  for (const entry of entries) {
+    if (seen.has(entry.url)) continue;
+    seen.add(entry.url);
+    position += 1;
+    output += `[${position}] ${entry.url}\n`;
+  }
+  return output;
+}
+
+function buildWebSearchTool(options?: AgentToolOptions): Record<string, unknown> | undefined {
+  if (!options) return undefined;
+  // Local compatibility policy, not an upstream equivalence to Sonar's sizes.
+  // Explicit budgets override either legacy default independently.
+  const legacyBudgets = options.search_context_size && {
+    low: { max_tokens: 2000, max_tokens_per_page: 512 },
+    medium: { max_tokens: 4000, max_tokens_per_page: 1024 },
+    high: { max_tokens: 8000, max_tokens_per_page: 2048 },
+  }[options.search_context_size];
+  const maxTokens = options.max_tokens ?? (legacyBudgets && legacyBudgets.max_tokens);
+  const maxTokensPerPage = options.max_tokens_per_page ?? (legacyBudgets && legacyBudgets.max_tokens_per_page);
+  const filters: Record<string, unknown> = {
+    ...(options.search_recency_filter && { search_recency_filter: options.search_recency_filter }),
+    ...(options.search_domain_filter && { search_domain_filter: options.search_domain_filter }),
+  };
+  const tool: Record<string, unknown> = {
+    type: "web_search",
+    ...(Object.keys(filters).length > 0 && { filters }),
+    ...(maxTokens !== undefined && { max_tokens: maxTokens }),
+    ...(maxTokensPerPage !== undefined && { max_tokens_per_page: maxTokensPerPage }),
+  };
+  // No override means the preset's own web_search config stays in effect.
+  return Object.keys(tool).length > 1 ? tool : undefined;
+}
+
+export async function performAgentResponse(
+  messages: Message[],
+  preset: string,
+  serviceOrigin?: string,
+  options?: AgentToolOptions,
+  hooks?: AgentCallHooks,
+  apiKey?: ApiKeyProvider,
+): Promise<string> {
+  const webSearchTool = buildWebSearchTool(options);
+
+  const body: Record<string, unknown> = {
+    preset,
+    input: messages.map((message) => ({
+      type: "message",
+      role: message.role,
+      content: message.content,
+    })),
+    // Always stream: long runs outlive intermediate proxy timeouts, and the
+    // reasoning events double as progress reporting.
+    stream: true,
+    ...(webSearchTool && { tools: [webSearchTool] }),
+  };
+
+  // PERPLEXITY_TIMEOUT_MS bounds the whole call, not just time-to-headers:
+  // streamed responses return headers immediately, so a headers-only timeout
+  // would never fire.
+  const TIMEOUT_MS = parseInt(process.env.PERPLEXITY_TIMEOUT_MS || "300000", 10);
+  const deadline = new AbortController();
+  const timeoutId = setTimeout(() => deadline.abort(), TIMEOUT_MS);
+  const abortDeadline = () => deadline.abort();
+  if (hooks?.signal) {
+    if (hooks.signal.aborted) {
+      deadline.abort();
+    } else {
+      hooks.signal.addEventListener("abort", abortDeadline, { once: true });
+    }
+  }
+
+  try {
+    const response = await makeApiRequest("v1/agent", body, serviceOrigin, deadline.signal, apiKey);
+    const agentResponse = await consumeAgentStream(response, hooks, serviceOrigin, deadline.signal, apiKey);
+    return formatAgentResponseText(agentResponse);
+  } catch (error) {
+    if (hooks?.signal?.aborted) {
+      throw new Error("Request cancelled");
+    }
+    if (deadline.signal.aborted) {
+      throw new Error(`Request timeout: Perplexity API did not respond within ${TIMEOUT_MS}ms. Consider increasing PERPLEXITY_TIMEOUT_MS.`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeoutId);
+    hooks?.signal?.removeEventListener("abort", abortDeadline);
+  }
 }
 
 export function formatSearchResults(data: SearchResponse): string {
@@ -316,6 +533,9 @@ export function formatSearchResults(data: SearchResponse): string {
     if (result.date) {
       formattedResults += `   Date: ${result.date}\n`;
     }
+    if (result.last_updated) {
+      formattedResults += `   Last updated: ${result.last_updated}\n`;
+    }
     formattedResults += `\n`;
   });
 
@@ -327,16 +547,21 @@ export async function performSearch(
   maxResults: number = 10,
   maxTokensPerPage: number = 1024,
   country?: string,
-  serviceOrigin?: string
+  filters?: SearchOptions,
+  serviceOrigin?: string,
+  apiKey?: ApiKeyProvider,
 ): Promise<string> {
   const body: Record<string, unknown> = {
     query: query,
     max_results: maxResults,
     max_tokens_per_page: maxTokensPerPage,
     ...(country && { country }),
+    ...(filters?.search_recency_filter && { search_recency_filter: filters.search_recency_filter }),
+    ...(filters?.search_domain_filter && { search_domain_filter: filters.search_domain_filter }),
+    ...(filters?.search_type && { search_type: filters.search_type }),
   };
 
-  const response = await makeApiRequest("search", body, serviceOrigin);
+  const response = await makeApiRequest("search", body, serviceOrigin, undefined, apiKey);
 
   let data: SearchResponse;
   try {
@@ -349,7 +574,38 @@ export async function performSearch(
   return formatSearchResults(data);
 }
 
-export function createPerplexityServer(serviceOrigin?: string) {
+interface ToolExtra {
+  signal?: AbortSignal;
+  _meta?: { progressToken?: string | number };
+  sendNotification?: (notification: {
+    method: string;
+    params: Record<string, unknown>;
+  }) => Promise<void>;
+}
+
+function buildHooks(extra: ToolExtra | undefined): AgentCallHooks {
+  const progressToken = extra?._meta?.progressToken;
+  const sendNotification = extra?.sendNotification;
+  let progress = 0;
+  return {
+    signal: extra?.signal,
+    onProgress:
+      progressToken !== undefined && sendNotification
+        ? (update) => {
+            void sendNotification({
+              method: "notifications/progress",
+              params: {
+                progressToken,
+                progress: ++progress,
+                message: update.message,
+              },
+            }).catch(() => {});
+          }
+        : undefined,
+  };
+}
+
+export function createPerplexityServer(serviceOrigin?: string, serverOptions?: PerplexityServerOptions) {
   const server = new McpServer(
     {
       name: "ai.perplexity/mcp-server",
@@ -357,12 +613,12 @@ export function createPerplexityServer(serviceOrigin?: string) {
     },
     {
       instructions:
-        "Perplexity AI server for web-grounded search, research, and reasoning. " +
+        "Perplexity AI server for web-grounded search, research, and reasoning, backed by the Perplexity Agent API. " +
         "\n\nTOOL TIMING (critical for Claude.ai web — has a hard 60s tool-call timeout):\n" +
         "- perplexity_search: 1-3s. Quick web search returning ranked results (title/URL/snippet/date). No AI synthesis.\n" +
-        "- perplexity_ask: 5-15s. Sonar Pro conversational answer with citations. PREFERRED for time-sensitive queries.\n" +
-        "- perplexity_reason: 10-30s. Sonar Reasoning Pro with chain-of-thought. May approach 60s on complex prompts.\n" +
-        "- perplexity_research (sync): 30-180s. Sonar Deep Research. WILL TIME OUT in Claude.ai web — use ONLY in Claude Desktop / Claude Code / terminal MCP clients.\n" +
+        "- perplexity_ask: ~5-15s. Agent API " + ASK_PRESET + " preset, answer with citations. PREFERRED for time-sensitive queries.\n" +
+        "- perplexity_reason: ~10-30s. Agent API " + REASON_PRESET + " preset, step-by-step reasoning. May approach 60s on complex prompts.\n" +
+        "- perplexity_research (sync): ~60-240s. Agent API " + RESEARCH_PRESET + " preset. WILL TIME OUT in Claude.ai web — use ONLY in Claude Desktop / Claude Code / terminal MCP clients.\n" +
         "- start_research + check_research (async): the timeout-safe alternative for deep research from any client. " +
         "Call start_research → returns job_id immediately → poll check_research every 30s until status='done'. Bypasses the 60s client cap.\n" +
         "\nSelection rule: for multi-topic 'give me a summary of X, Y, Z' queries from Claude.ai web, prefer perplexity_ask. " +
@@ -376,62 +632,55 @@ export function createPerplexityServer(serviceOrigin?: string) {
     role: z.enum(["system", "user", "assistant"]).describe("Role of the message sender"),
     content: z.string().describe("The content of the message"),
   });
-  
+
   const messagesField = z.array(messageSchema).describe("Array of conversation messages");
-  
-  const stripThinkingField = z.boolean().optional()
-    .describe("If true, removes <think>...</think> tags and their content from the response to save context tokens. Default is false.");
-  
+
   const searchRecencyFilterField = z.enum(["hour", "day", "week", "month", "year"]).optional()
     .describe("Filter search results by recency. Use 'hour' for very recent news, 'day' for today's updates, 'week' for this week, etc.");
-  
+
   const searchDomainFilterField = z.array(z.string()).optional()
     .describe("Restrict search results to specific domains (e.g., ['wikipedia.org', 'arxiv.org']). Use '-' prefix for exclusion (e.g., ['-reddit.com']).");
-  
+
   const searchContextSizeField = z.enum(["low", "medium", "high"]).optional()
-    .describe("Controls how much web context is retrieved. 'low' (default) is fastest, 'high' provides more comprehensive results.");
-  
-  const reasoningEffortField = z.enum(["minimal", "low", "medium", "high"]).optional()
-    .describe("Controls depth of deep research reasoning. Higher values produce more thorough analysis.");
-  
+    .describe("Deprecated compatibility shorthand for search token budgets: low=2000/512, medium=4000/1024, high=8000/2048 (total/per-page). Explicit max_tokens and max_tokens_per_page override these defaults.");
+  const MAX_SEARCH_TOKENS = 120_000;
+  const MAX_SEARCH_TOKENS_PER_PAGE = 20_000;
+  const maxTokensField = z.number().int().positive().max(MAX_SEARCH_TOKENS).optional()
+    .describe("Maximum total search-context tokens, not generated answer tokens. Overrides the legacy search_context_size total budget.");
+  const maxTokensPerPageField = z.number().int().positive().max(MAX_SEARCH_TOKENS_PER_PAGE).optional()
+    .describe("Maximum search-context tokens extracted per result page. Overrides the legacy search_context_size per-page budget.");
+
   const responseOutputSchema = {
     response: z.string().describe("AI-generated text response with numbered citation references"),
   };
 
   // Input schemas
-  const messagesOnlyInputSchema = { 
+  const askAndReasonInputSchema = {
     messages: messagesField,
     search_recency_filter: searchRecencyFilterField,
     search_domain_filter: searchDomainFilterField,
     search_context_size: searchContextSizeField,
-  };
-  const messagesWithStripThinkingInputSchema = { 
-    messages: messagesField, 
-    strip_thinking: stripThinkingField,
-    search_recency_filter: searchRecencyFilterField,
-    search_domain_filter: searchDomainFilterField,
-    search_context_size: searchContextSizeField,
+    max_tokens: maxTokensField,
+    max_tokens_per_page: maxTokensPerPageField,
   };
   const researchInputSchema = {
     messages: messagesField,
-    strip_thinking: stripThinkingField,
-    reasoning_effort: reasoningEffortField,
   };
 
   server.registerTool(
     "perplexity_ask",
     {
       title: "Ask Perplexity",
-      description: "Answer a question using web-grounded AI (Sonar Pro model). " +
-        "Latency: 5-15s typical. SAFE for Claude.ai web (60s client cap). " +
+      description: "Answer a question using web-grounded AI (Perplexity Agent API, " + ASK_PRESET + " preset). " +
+        "Latency: ~5-15s typical. SAFE for Claude.ai web (60s client cap). " +
         "Best for: quick factual questions, summaries, explanations, general Q&A, and " +
         "MULTI-TOPIC SUMMARIES that would otherwise need slow research. " +
-        "Returns a text response with numbered citations. Fast and cheap. " +
-        "Supports filtering by recency (hour/day/week/month/year), domain restrictions, and search context size. " +
+        "Returns a text response with numbered citations. Fastest and cheapest option. " +
+        "Supports filtering by recency (hour/day/week/month/year), domain restrictions, and search token budgets. " +
         "For deep multi-source research from a timeout-tolerant client, use perplexity_research. " +
         "For deep research from Claude.ai web (60s cap), use start_research + check_research instead. " +
         "For step-by-step reasoning, use perplexity_reason.",
-      inputSchema: messagesOnlyInputSchema as any,
+      inputSchema: askAndReasonInputSchema as any,
       outputSchema: responseOutputSchema as any,
       annotations: {
         readOnlyHint: true,
@@ -440,20 +689,31 @@ export function createPerplexityServer(serviceOrigin?: string) {
         destructiveHint: false,
       },
     },
-    async (args: any) => {
-      const { messages, search_recency_filter, search_domain_filter, search_context_size } = args as { 
+    async (args: any, extra: any) => {
+      const { messages, search_recency_filter, search_domain_filter, search_context_size, max_tokens, max_tokens_per_page } = args as {
         messages: Message[];
         search_recency_filter?: "hour" | "day" | "week" | "month" | "year";
         search_domain_filter?: string[];
         search_context_size?: "low" | "medium" | "high";
+        max_tokens?: number;
+        max_tokens_per_page?: number;
       };
       validateMessages(messages, "perplexity_ask");
       const options = {
         ...(search_recency_filter && { search_recency_filter }),
         ...(search_domain_filter && { search_domain_filter }),
         ...(search_context_size && { search_context_size }),
+        ...(max_tokens !== undefined && { max_tokens }),
+        ...(max_tokens_per_page !== undefined && { max_tokens_per_page }),
       };
-      const result = await performChatCompletion(messages, "sonar-pro", false, serviceOrigin, Object.keys(options).length > 0 ? options : undefined);
+      const result = await performAgentResponse(
+        messages,
+        ASK_PRESET,
+        serviceOrigin,
+        Object.keys(options).length > 0 ? options : undefined,
+        buildHooks(extra),
+        serverOptions?.apiKey,
+      );
       return {
         content: [{ type: "text" as const, text: result }],
         structuredContent: { response: result },
@@ -465,10 +725,10 @@ export function createPerplexityServer(serviceOrigin?: string) {
     "perplexity_research",
     {
       title: "Deep Research (sync — may time out)",
-      description: "Conduct deep, multi-source research on a topic (Sonar Deep Research model). " +
-        "Latency: 30-180+ seconds. ⚠️ WILL TIME OUT in Claude.ai web (60s hard client cap). " +
+      description: "Conduct deep, multi-source research on a topic (Perplexity Agent API, " + RESEARCH_PRESET + " preset). " +
+        "Latency: ~60-240 seconds. WILL TIME OUT in Claude.ai web (60s hard client cap). " +
         "Use ONLY in Claude Desktop, Claude Code, terminal MCP clients, or other " +
-        "clients with >180s tool-call tolerance. " +
+        "clients with long tool-call tolerance. " +
         "From Claude.ai web: use start_research + check_research instead (async pattern, no cap). " +
         "Best for: literature reviews, comprehensive overviews, investigative queries needing " +
         "many sources. Returns a detailed response with numbered citations. " +
@@ -483,18 +743,17 @@ export function createPerplexityServer(serviceOrigin?: string) {
         destructiveHint: false,
       },
     },
-    async (args: any) => {
-      const { messages, strip_thinking, reasoning_effort } = args as { 
-        messages: Message[];
-        strip_thinking?: boolean;
-        reasoning_effort?: "minimal" | "low" | "medium" | "high";
-      };
+    async (args: any, extra: any) => {
+      const { messages } = args as { messages: Message[] };
       validateMessages(messages, "perplexity_research");
-      const stripThinking = typeof strip_thinking === "boolean" ? strip_thinking : false;
-      const options = {
-        ...(reasoning_effort && { reasoning_effort }),
-      };
-      const result = await performChatCompletion(messages, "sonar-deep-research", stripThinking, serviceOrigin, Object.keys(options).length > 0 ? options : undefined);
+      const result = await performAgentResponse(
+        messages,
+        RESEARCH_PRESET,
+        serviceOrigin,
+        undefined,
+        buildHooks(extra),
+        serverOptions?.apiKey,
+      );
       return {
         content: [{ type: "text" as const, text: result }],
         structuredContent: { response: result },
@@ -506,14 +765,14 @@ export function createPerplexityServer(serviceOrigin?: string) {
     "perplexity_reason",
     {
       title: "Advanced Reasoning",
-      description: "Analyze a question using step-by-step reasoning with web grounding (Sonar Reasoning Pro model). " +
-        "Latency: 10-30s typical, can approach 60s on complex prompts (risk of Claude.ai web timeout). " +
+      description: "Analyze a question using step-by-step reasoning with web grounding (Perplexity Agent API, " + REASON_PRESET + " preset). " +
+        "Latency: ~10-30s typical, can approach 60s on complex prompts (risk of Claude.ai web timeout). " +
         "Best for: math, logic, comparisons, complex arguments, and tasks requiring chain-of-thought. " +
         "Returns a reasoned response with numbered citations. " +
-        "Supports filtering by recency (hour/day/week/month/year), domain restrictions, and search context size. " +
+        "Supports filtering by recency (hour/day/week/month/year), domain restrictions, and search token budgets. " +
         "For quick factual questions, use perplexity_ask. " +
         "For comprehensive multi-source research, use perplexity_research (sync) or start_research (async).",
-      inputSchema: messagesWithStripThinkingInputSchema as any,
+      inputSchema: askAndReasonInputSchema as any,
       outputSchema: responseOutputSchema as any,
       annotations: {
         readOnlyHint: true,
@@ -522,22 +781,31 @@ export function createPerplexityServer(serviceOrigin?: string) {
         destructiveHint: false,
       },
     },
-    async (args: any) => {
-      const { messages, strip_thinking, search_recency_filter, search_domain_filter, search_context_size } = args as { 
+    async (args: any, extra: any) => {
+      const { messages, search_recency_filter, search_domain_filter, search_context_size, max_tokens, max_tokens_per_page } = args as {
         messages: Message[];
-        strip_thinking?: boolean;
         search_recency_filter?: "hour" | "day" | "week" | "month" | "year";
         search_domain_filter?: string[];
         search_context_size?: "low" | "medium" | "high";
+        max_tokens?: number;
+        max_tokens_per_page?: number;
       };
       validateMessages(messages, "perplexity_reason");
-      const stripThinking = typeof strip_thinking === "boolean" ? strip_thinking : false;
       const options = {
         ...(search_recency_filter && { search_recency_filter }),
         ...(search_domain_filter && { search_domain_filter }),
         ...(search_context_size && { search_context_size }),
+        ...(max_tokens !== undefined && { max_tokens }),
+        ...(max_tokens_per_page !== undefined && { max_tokens_per_page }),
       };
-      const result = await performChatCompletion(messages, "sonar-reasoning-pro", stripThinking, serviceOrigin, Object.keys(options).length > 0 ? options : undefined);
+      const result = await performAgentResponse(
+        messages,
+        REASON_PRESET,
+        serviceOrigin,
+        Object.keys(options).length > 0 ? options : undefined,
+        buildHooks(extra),
+        serverOptions?.apiKey,
+      );
       return {
         content: [{ type: "text" as const, text: result }],
         structuredContent: { response: result },
@@ -553,8 +821,12 @@ export function createPerplexityServer(serviceOrigin?: string) {
       .describe("Maximum tokens to extract per webpage (default: 1024)"),
     country: z.string().optional()
       .describe("ISO 3166-1 alpha-2 country code for regional results (e.g., 'US', 'GB')"),
+    search_recency_filter: searchRecencyFilterField,
+    search_domain_filter: searchDomainFilterField,
+    search_type: z.enum(["web", "fast"]).optional()
+      .describe("Search backend. 'web' (default) is the standard web search. 'fast' is lower latency and lower cost; prefer it for routine lookups inside agent loops, and keep 'web' for rare or ambiguous questions."),
   };
-  
+
   const searchOutputSchema = {
     results: z.string().describe("Formatted search results, each with title, URL, snippet, and date"),
   };
@@ -566,7 +838,8 @@ export function createPerplexityServer(serviceOrigin?: string) {
       description: "Search the web and return a ranked list of results with titles, URLs, snippets, and dates. " +
         "Latency: 1-3s. FASTEST tool — always safe within Claude.ai web 60s cap. " +
         "Best for: finding specific URLs, checking recent news, verifying facts, discovering sources. " +
-        "Returns formatted results (title, URL, snippet, date) — no AI synthesis. " +
+        "Returns formatted results (title, URL, snippet, date) with no AI synthesis. " +
+        "Supports recency filters, domain restrictions, and a lower-latency fast search mode. " +
         "For AI-generated answers with citations, use perplexity_ask instead.",
       inputSchema: searchInputSchema as any,
       outputSchema: searchOutputSchema as any,
@@ -578,17 +851,25 @@ export function createPerplexityServer(serviceOrigin?: string) {
       },
     },
     async (args: any) => {
-      const { query, max_results, max_tokens_per_page, country } = args as {
+      const { query, max_results, max_tokens_per_page, country, search_recency_filter, search_domain_filter, search_type } = args as {
         query: string;
         max_results?: number;
         max_tokens_per_page?: number;
         country?: string;
+        search_recency_filter?: "hour" | "day" | "week" | "month" | "year";
+        search_domain_filter?: string[];
+        search_type?: SearchType;
       };
       const maxResults = typeof max_results === "number" ? max_results : 10;
       const maxTokensPerPage = typeof max_tokens_per_page === "number" ? max_tokens_per_page : 1024;
       const countryCode = typeof country === "string" ? country : undefined;
-      
-      const result = await performSearch(query, maxResults, maxTokensPerPage, countryCode, serviceOrigin);
+      const filters: SearchOptions = {
+        ...(search_recency_filter && { search_recency_filter }),
+        ...(search_domain_filter && { search_domain_filter }),
+        ...(search_type && { search_type }),
+      };
+
+      const result = await performSearch(query, maxResults, maxTokensPerPage, countryCode, filters, serviceOrigin, serverOptions?.apiKey);
       return {
         content: [{ type: "text" as const, text: result }],
         structuredContent: { results: result },
@@ -597,14 +878,12 @@ export function createPerplexityServer(serviceOrigin?: string) {
   );
 
   // =====================================================================
-  // FORK ADDITION: async polling pattern for sonar-deep-research.
+  // FORK ADDITION: async polling pattern for deep research (RESEARCH_PRESET).
   // Bypasses Claude.ai web's 60s hard tool-call timeout.
   // =====================================================================
 
   const startResearchInputSchema = {
     messages: messagesField,
-    strip_thinking: stripThinkingField,
-    reasoning_effort: reasoningEffortField,
   };
   const startResearchOutputSchema = {
     job_id: z.string().describe("Opaque job identifier — pass to check_research to poll status"),
@@ -616,7 +895,7 @@ export function createPerplexityServer(serviceOrigin?: string) {
     "start_research",
     {
       title: "Start Deep Research (async)",
-      description: "Kick off a sonar-deep-research job and return immediately with a job_id (~1s). " +
+      description: "Kick off a deep research job (Agent API " + RESEARCH_PRESET + " preset) and return immediately with a job_id (~1s). " +
         "Use this from Claude.ai web (or any client with <60s tool-call timeout) to do deep " +
         "research without hitting the cap. After calling: poll check_research every 30s with " +
         "the returned job_id until status='done'. Typical completion: 30-180s. " +
@@ -631,11 +910,7 @@ export function createPerplexityServer(serviceOrigin?: string) {
       },
     },
     async (args: any) => {
-      const { messages, strip_thinking, reasoning_effort } = args as {
-        messages: Message[];
-        strip_thinking?: boolean;
-        reasoning_effort?: "minimal" | "low" | "medium" | "high";
-      };
+      const { messages } = args as { messages: Message[] };
       validateMessages(messages, "start_research");
 
       let inflight = 0;
@@ -669,14 +944,13 @@ export function createPerplexityServer(serviceOrigin?: string) {
       (async () => {
         job.status = "running";
         try {
-          const stripThinking = typeof strip_thinking === "boolean" ? strip_thinking : false;
-          const options = reasoning_effort ? { reasoning_effort } : undefined;
-          const result = await performChatCompletion(
+          const result = await performAgentResponse(
             messages,
-            "sonar-deep-research",
-            stripThinking,
+            RESEARCH_PRESET,
             serviceOrigin,
-            options as ChatCompletionOptions | undefined,
+            undefined,
+            undefined,
+            serverOptions?.apiKey,
           );
           job.status = "done";
           job.result = result;
@@ -793,6 +1067,42 @@ export function createPerplexityServer(serviceOrigin?: string) {
     },
   );
 
+  advertiseJsonSchema202012(server.server);
+
   return server.server;
 }
 
+// The MCP TypeScript SDK stamps draft-07 on tools/list schemas
+// (modelcontextprotocol/typescript-sdk#2084); 2020-12-only clients reject
+// them. The schemas are valid under both dialects, so only the declared
+// dialect needs rewriting. Remove once typescript-sdk#2085 ships.
+const JSON_SCHEMA_2020_12 = "https://json-schema.org/draft/2020-12/schema";
+
+function advertiseJsonSchema202012(server: McpServer["server"]) {
+  type ListToolsHandler = (request: unknown, extra: unknown) => Promise<{
+    tools: Array<{
+      inputSchema?: { $schema?: string };
+      outputSchema?: { $schema?: string };
+    }>;
+  }>;
+  // _requestHandlers is private SDK state; goes away with this shim.
+  const handlers = (server as unknown as {
+    _requestHandlers: Map<string, ListToolsHandler>;
+  })._requestHandlers;
+  const listTools = handlers.get("tools/list");
+  if (!listTools) {
+    return;
+  }
+  handlers.set("tools/list", async (request, extra) => {
+    const result = await listTools(request, extra);
+    for (const tool of result.tools ?? []) {
+      if (tool.inputSchema?.$schema) {
+        tool.inputSchema.$schema = JSON_SCHEMA_2020_12;
+      }
+      if (tool.outputSchema?.$schema) {
+        tool.outputSchema.$schema = JSON_SCHEMA_2020_12;
+      }
+    }
+    return result;
+  });
+}

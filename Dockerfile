@@ -1,4 +1,4 @@
-FROM node:22.12-alpine AS builder
+FROM node:24.21.0-alpine AS builder
 
 WORKDIR /app
 
@@ -11,7 +11,7 @@ COPY src/ ./src/
 
 RUN npm run build
 
-FROM node:22-alpine AS release
+FROM node:24.21.0-alpine AS release
 
 WORKDIR /app
 
