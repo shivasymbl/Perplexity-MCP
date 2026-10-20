@@ -42,6 +42,8 @@ const RESEARCH_JOBS = new Map<string, ResearchJob>();
 
 const JOB_RETENTION_MS = 30 * 60_000; // 30 min for completed jobs
 const JOB_HARD_TIMEOUT_MS = 5 * 60_000; // 5 min for stuck pending/running jobs
+// Bounds memory and paid deep-research spend from start_research bursts.
+export const MAX_INFLIGHT_RESEARCH_JOBS = 10;
 
 function gcResearchJobs(): void {
   const now = Date.now();
@@ -635,6 +637,22 @@ export function createPerplexityServer(serviceOrigin?: string) {
         reasoning_effort?: "minimal" | "low" | "medium" | "high";
       };
       validateMessages(messages, "start_research");
+
+      let inflight = 0;
+      for (const j of RESEARCH_JOBS.values()) {
+        if (j.status === "pending" || j.status === "running") inflight++;
+      }
+      if (inflight >= MAX_INFLIGHT_RESEARCH_JOBS) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Too many research jobs in flight (${inflight}/${MAX_INFLIGHT_RESEARCH_JOBS}). Retry after a running job finishes.`,
+            },
+          ],
+          isError: true,
+        };
+      }
 
       const id = randomUUID();
       const lastUserMsg = [...messages].reverse().find((m) => m.role === "user");

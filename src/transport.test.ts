@@ -149,7 +149,7 @@ describe("Transport Integration Tests", () => {
       expect(data.id).toBe(1);
       expect(data.result).toBeDefined();
       expect(data.result.tools).toBeDefined();
-      expect(data.result.tools).toHaveLength(4);
+      expect(data.result.tools).toHaveLength(6);
       
       // Verify all four tools are present
       const toolNames = data.result.tools.map((t: { name: string }) => t.name);

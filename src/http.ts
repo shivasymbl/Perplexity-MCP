@@ -5,6 +5,7 @@ import cors from "cors";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { createPerplexityServer } from "./server.js";
 import { logger } from "./logger.js";
+import { requireBearerToken } from "./auth.js";
 
 const PERPLEXITY_API_KEY = process.env.PERPLEXITY_API_KEY;
 if (!PERPLEXITY_API_KEY) {
@@ -33,10 +34,15 @@ app.use(cors({
     }
   },
   exposedHeaders: ["Mcp-Session-Id", "mcp-protocol-version"],
-  allowedHeaders: ["Content-Type", "mcp-session-id"],
+  allowedHeaders: ["Content-Type", "mcp-session-id", "Authorization"],
 }));
 
 app.use(express.json());
+
+if (!process.env.MCP_AUTH_TOKEN) {
+  logger.warn("MCP_AUTH_TOKEN is not set: /mcp is unauthenticated");
+}
+app.use("/mcp", requireBearerToken(process.env.MCP_AUTH_TOKEN));
 
 app.all("/mcp", async (req, res) => {
   try {
