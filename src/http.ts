@@ -13,6 +13,13 @@ if (!PERPLEXITY_API_KEY) {
   process.exit(1);
 }
 
+// Fail closed: the HTTP transport is internet-facing and must never serve /mcp unauthenticated.
+const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN?.trim();
+if (!MCP_AUTH_TOKEN) {
+  logger.error("MCP_AUTH_TOKEN environment variable is required for the HTTP transport; refusing to start");
+  process.exit(1);
+}
+
 const app = express();
 const PORT = parseInt(process.env.PORT || "8080", 10);
 const BIND_ADDRESS = process.env.BIND_ADDRESS || "0.0.0.0";
@@ -39,10 +46,7 @@ app.use(cors({
 
 app.use(express.json());
 
-if (!process.env.MCP_AUTH_TOKEN) {
-  logger.warn("MCP_AUTH_TOKEN is not set: /mcp is unauthenticated");
-}
-app.use("/mcp", requireBearerToken(process.env.MCP_AUTH_TOKEN));
+app.use("/mcp", requireBearerToken(MCP_AUTH_TOKEN));
 
 app.all("/mcp", async (req, res) => {
   try {

@@ -3,9 +3,9 @@ import type { RequestHandler } from "express";
 
 const digest = (s: string) => createHash("sha256").update(s).digest();
 
-// Opt-in bearer auth: when no token is configured, every request is allowed.
+// Fail-closed bearer auth: a missing/blank token is a configuration error, never "allow all".
 export function requireBearerToken(token: string | undefined): RequestHandler {
-  if (!token) return (_req, _res, next) => next();
+  if (!token?.trim()) throw new Error("MCP_AUTH_TOKEN is required");
   const expected = digest(`Bearer ${token}`);
   return (req, res, next) => {
     if (timingSafeEqual(digest(req.headers.authorization ?? ""), expected)) return next();

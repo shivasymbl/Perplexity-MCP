@@ -1,6 +1,8 @@
 import { describe, it, expect, afterEach } from "vitest";
 import express from "express";
 import { Server } from "http";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { requireBearerToken } from "./auth.js";
 
 describe("requireBearerToken", () => {
@@ -20,10 +22,20 @@ describe("requireBearerToken", () => {
     return `http://localhost:${typeof addr === "object" && addr ? addr.port : 0}/mcp`;
   }
 
-  it("allows all requests when no token is configured", async () => {
-    const url = await start(undefined);
-    expect((await fetch(url, { method: "POST" })).status).toBe(200);
+  it.each([undefined, "", "   "])("refuses to build without a token (%j)", (token) => {
+    expect(() => requireBearerToken(token)).toThrow("MCP_AUTH_TOKEN is required");
   });
+
+  it.each([undefined, "", "   "])("http server refuses to start without MCP_AUTH_TOKEN (%j)", (token) => {
+    const env: NodeJS.ProcessEnv = { ...process.env, PERPLEXITY_API_KEY: "test-api-key", PORT: "0" };
+    delete env.MCP_AUTH_TOKEN;
+    if (token !== undefined) env.MCP_AUTH_TOKEN = token;
+    const tsx = fileURLToPath(new URL("../node_modules/.bin/tsx", import.meta.url));
+    const httpTs = fileURLToPath(new URL("./http.ts", import.meta.url));
+    const r = spawnSync(tsx, [httpTs], { env, encoding: "utf8", timeout: 15000 });
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain("MCP_AUTH_TOKEN environment variable is required");
+  }, 20000);
 
   it("rejects requests without Authorization when a token is configured", async () => {
     const url = await start("s3cret");
